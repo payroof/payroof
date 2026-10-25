@@ -12,6 +12,8 @@ Payroof gives each order its own payment address, watches the chains for money
 arriving, and tells your app with a signed webhook. It only knows public keys, so it
 can watch your addresses but can never spend from them.
 
+A public server runs at [`api.payroof.top`](https://payroof.top), ready for Payroof Wallet and Stor. Or run your own.
+
 ## Features
 
 - **Watch-only**: one deterministic address per reference, spendable only from your wallet.
