@@ -1,0 +1,23 @@
+# One hardened Payroof service. Put your configuration in ./payroof.toml (start from
+# config/payroof.example.toml) and the keys in the environment or a .env file.
+#   docker compose up -d        # pulls the release image, or builds it with --build
+services:
+  payroof:
+    image: ghcr.io/payroof/payroof:0.1.0
+    build: .
+    restart: unless-stopped
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    tmpfs: [/tmp]
+    ports: ["8080:8080"]
+    environment:
+      PAYROOF_ALTCHA_KEY: ${PAYROOF_ALTCHA_KEY:?set PAYROOF_ALTCHA_KEY (32 random bytes, hex)}
+      PAYROOF_CURSOR_KEY: ${PAYROOF_CURSOR_KEY:?set PAYROOF_CURSOR_KEY (32 random bytes, hex)}
+      PAYROOF_MASTER_KEY: ${PAYROOF_MASTER_KEY:?set PAYROOF_MASTER_KEY (32 random bytes, hex)}
+      RUST_LOG: ${RUST_LOG:-info}
+    volumes:
+      - ./payroof.toml:/etc/payroof/payroof.toml:ro
+      - data:/data
+volumes:
+  data:

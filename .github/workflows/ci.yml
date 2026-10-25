@@ -1,0 +1,37 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+env:
+  CARGO_TERM_COLOR: always
+jobs:
+  rust:
+    name: fmt · clippy · test · release build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install  # the version and components in rust-toolchain.toml
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release
+      - run: du -h target/release/payroof | tee -a "$GITHUB_STEP_SUMMARY"
+  docker:
+    name: container image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: docker build -t payroof:ci .
+      - name: Report size; the built-in healthcheck fails cleanly when nothing listens
+        run: |
+          docker image ls payroof:ci --format 'payroof:ci {{.Size}}' | tee -a "$GITHUB_STEP_SUMMARY"
+          ! docker run --rm payroof:ci healthcheck http://127.0.0.1:9/readyz

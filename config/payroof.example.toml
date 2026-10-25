@@ -1,0 +1,128 @@
+# A deployment watching the same networks, coins and tokens Payroof Wallet starts with.
+# Payroof watches exactly what is listed here: nothing can be added at runtime.
+# Review every RPC, confirmation depth and asset before use.
+bind = "0.0.0.0:8080"
+origin = "https://api.example.com"
+# Other origins this server is served at, if any; recovery signatures may name them.
+# origin_aliases = ["https://payroof.example.com"]
+database = "sqlite:///data/payroof.sqlite"
+development = false
+# Only list CIDRs of reverse proxies you operate. Other forwarding headers are ignored.
+trusted_proxies = []
+
+# Ethereum
+[[chains]]
+id = "eip155:1"
+name = "Ethereum"
+rpc = "https://ethereum.publicnode.com"
+confirmations = 12
+# start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
+[[chains.assets]]
+id = "eip155:1/slip44:60"
+kind = "native"
+symbol = "ETH"
+decimals = 18
+[[chains.assets]]
+id = "eip155:1/erc20:0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48"
+kind = "erc20"
+symbol = "USDC"
+decimals = 6
+[[chains.assets]]
+id = "eip155:1/erc20:0xdac17f958d2ee523a2206206994597c13d831ec7"
+kind = "erc20"
+symbol = "USDT"
+decimals = 6
+[[chains.assets]]
+id = "eip155:1/erc20:0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2"
+kind = "erc20"
+symbol = "WETH"
+decimals = 18
+
+# Base
+[[chains]]
+id = "eip155:8453"
+name = "Base"
+rpc = "https://base.publicnode.com"
+confirmations = 20
+# start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
+[[chains.assets]]
+id = "eip155:8453/slip44:60"
+kind = "native"
+symbol = "ETH"
+decimals = 18
+[[chains.assets]]
+id = "eip155:8453/erc20:0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+kind = "erc20"
+symbol = "USDC"
+decimals = 6
+
+# Polygon
+[[chains]]
+id = "eip155:137"
+name = "Polygon"
+rpc = "https://polygon.drpc.org"
+confirmations = 128
+# start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
+[[chains.assets]]
+id = "eip155:137/slip44:966"
+kind = "native"
+symbol = "POL"
+decimals = 18
+[[chains.assets]]
+id = "eip155:137/erc20:0x3c499c542cef5e3811e1192ce70d8cc03d5c3359"
+kind = "erc20"
+symbol = "USDC"
+decimals = 6
+
+# Arbitrum One
+[[chains]]
+id = "eip155:42161"
+name = "Arbitrum One"
+rpc = "https://arb1.arbitrum.io/rpc"
+confirmations = 20
+# start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
+[[chains.assets]]
+id = "eip155:42161/slip44:60"
+kind = "native"
+symbol = "ETH"
+decimals = 18
+[[chains.assets]]
+id = "eip155:42161/erc20:0xaf88d065e77c8cc2239327c5edb3a432268e5831"
+kind = "erc20"
+symbol = "USDC"
+decimals = 6
+
+# BNB Smart Chain
+[[chains]]
+id = "eip155:56"
+name = "BNB Smart Chain"
+rpc = "https://bsc.publicnode.com"
+confirmations = 15
+# start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
+[[chains.assets]]
+id = "eip155:56/slip44:714"
+kind = "native"
+symbol = "BNB"
+decimals = 18
+
+# Omitted limits retain safe defaults. Zero, negative, and excessive values fail startup.
+[limits]
+project_per_minute = 3
+pairing_per_minute = 5
+recovery_per_minute = 5
+challenge_per_minute = 10
+public_per_day = 30
+reads_per_minute = 300
+mutations_per_minute = 30
+allocations_per_minute = 120
+paths_per_minute = 30
+general_body = 16384
+pairing_body = 2048
+project_body = 32768
+concurrency = 64
+project_concurrency = 8
+pairing_concurrency = 8
+allocation_concurrency = 32
+pairing_capacity = 10000
+path_page = 1000
+rate_limit_entries = 100000

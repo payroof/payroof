@@ -1,0 +1,42 @@
+# Local development against Anvil (`cargo run -- config/payroof.local.toml`).
+# For a deployment, start from config/payroof.example.toml.
+bind = "127.0.0.1:8080"
+origin = "http://127.0.0.1:8080"
+database = "sqlite://payroof.sqlite"
+development = true
+# Development explicitly allows HTTP/private container destinations; never enable in production.
+# Only list CIDRs of reverse proxies you operate. Other forwarding headers are ignored.
+trusted_proxies = []
+[[chains]]
+id = "eip155:31337"
+name = "Anvil"
+rpc = "http://127.0.0.1:8545"
+confirmations = 2
+start_height = 0
+[[chains.assets]]
+id = "eip155:31337/slip44:60"
+kind = "native"
+symbol = "ETH"
+decimals = 18
+
+# Omitted limits retain safe defaults. Zero, negative, and excessive values fail startup.
+[limits]
+project_per_minute = 3
+pairing_per_minute = 5
+recovery_per_minute = 5
+challenge_per_minute = 10
+public_per_day = 30
+reads_per_minute = 300
+mutations_per_minute = 30
+allocations_per_minute = 120
+paths_per_minute = 30
+general_body = 16384
+pairing_body = 2048
+project_body = 32768
+concurrency = 64
+project_concurrency = 8
+pairing_concurrency = 8
+allocation_concurrency = 32
+pairing_capacity = 10000
+path_page = 1000
+rate_limit_entries = 100000

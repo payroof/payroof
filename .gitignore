@@ -1,0 +1,6 @@
+/target/
+.env
+*.sqlite*
+*.log
+.DS_Store
+/payroof.toml
