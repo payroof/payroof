@@ -110,11 +110,64 @@ pub struct Chain {
     pub id: String,
     /// Display name shown to integrations, e.g. "Ethereum".
     pub name: String,
-    pub rpc: String,
+    /// One RPC URL (`rpc = "https://..."`) or several in priority order
+    /// (`rpc = ["https://...", "https://..."]`); the later ones are fallbacks.
+    pub rpc: RpcUrls,
     pub confirmations: u32,
+    /// Milliseconds between polls for new blocks. Omitted: about half the chain's
+    /// block time (see [`default_poll_interval_ms`]).
+    pub poll_interval_ms: Option<u64>,
     /// First block to scan. Omitted: the chain's head when Payroof first runs.
     pub start_height: Option<u64>,
     pub assets: Vec<Asset>,
+}
+/// The RPC endpoints of a chain, in priority order. Accepts a string or a list.
+/// URLs usually embed API keys, so `Debug` shows only each endpoint's host.
+#[derive(Clone, Deserialize)]
+#[serde(untagged)]
+pub enum RpcUrls {
+    One(String),
+    Many(Vec<String>),
+}
+impl RpcUrls {
+    pub fn urls(&self) -> &[String] {
+        match self {
+            Self::One(url) => std::slice::from_ref(url),
+            Self::Many(urls) => urls,
+        }
+    }
+}
+impl std::fmt::Debug for RpcUrls {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_list()
+            .entries(
+                self.urls()
+                    .iter()
+                    .map(|url| crate::scanner::rpc::redact(url)),
+            )
+            .finish()
+    }
+}
+/// At most this many endpoints per chain.
+pub const MAX_RPC_URLS: usize = 8;
+pub const MIN_POLL_INTERVAL_MS: u64 = 100;
+pub const MAX_POLL_INTERVAL_MS: u64 = 300_000;
+/// Poll interval for a chain id: roughly half its block time, 2s when unknown.
+pub fn default_poll_interval_ms(chain_id: &str) -> u64 {
+    match chain_id {
+        "eip155:1" => 6000,
+        "eip155:56" => 1500,
+        "eip155:42161" => 1000,
+        _ => 2000, // includes Base and Polygon (2s blocks)
+    }
+}
+impl Chain {
+    pub fn poll_interval(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(
+            self.poll_interval_ms
+                .unwrap_or_else(|| default_poll_interval_ms(&self.id)),
+        )
+    }
 }
 #[derive(Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -164,7 +217,10 @@ impl Config {
                     && chain.name.trim() == chain.name
                     && !chain.name.chars().any(char::is_control)
                     && chain.confirmations > 0
-                    && chain.start_height.is_none_or(|h| h <= i64::MAX as u64),
+                    && chain.start_height.is_none_or(|h| h <= i64::MAX as u64)
+                    && chain.poll_interval_ms.is_none_or(|ms| (MIN_POLL_INTERVAL_MS
+                        ..=MAX_POLL_INTERVAL_MS)
+                        .contains(&ms)),
                 "invalid chain config"
             );
             let id: u64 = chain
@@ -176,16 +232,32 @@ impl Config {
                 id > 0 && chain.id == format!("eip155:{id}"),
                 "invalid chain id"
             );
-            let rpc = url::Url::parse(&chain.rpc)?;
+            let urls = chain.rpc.urls();
             anyhow::ensure!(
-                rpc.username().is_empty() && rpc.password().is_none() && rpc.fragment().is_none(),
-                "invalid RPC"
+                (1..=MAX_RPC_URLS).contains(&urls.len()),
+                "chain {} needs 1-{MAX_RPC_URLS} RPC URLs",
+                chain.id
             );
-            anyhow::ensure!(
-                rpc.scheme() == "https"
-                    || (c.development && rpc.scheme() == "http" && rpc.host_str().is_some()),
-                "HTTPS RPC required"
-            );
+            let mut seen = std::collections::BTreeSet::new();
+            for raw in urls {
+                // Never put the URL (it may hold an API key) into an error.
+                let rpc = url::Url::parse(raw)
+                    .map_err(|_| anyhow::anyhow!("invalid RPC URL for chain {}", chain.id))?;
+                anyhow::ensure!(
+                    rpc.username().is_empty()
+                        && rpc.password().is_none()
+                        && rpc.fragment().is_none()
+                        && seen.insert(rpc.to_string()),
+                    "invalid or duplicate RPC for chain {}",
+                    chain.id
+                );
+                anyhow::ensure!(
+                    rpc.scheme() == "https"
+                        || (c.development && rpc.scheme() == "http" && rpc.host_str().is_some()),
+                    "HTTPS RPC required for chain {}",
+                    chain.id
+                );
+            }
             let mut assets = std::collections::BTreeSet::new();
             for a in &chain.assets {
                 anyhow::ensure!(
@@ -237,6 +309,83 @@ mod tests {
         assert!(!config.development && config.chains.len() > 1);
         assert!(config.chains.iter().all(|c| c.start_height.is_none()));
         std::fs::write(&path, source.replacen("https://", "http://", 2)).unwrap();
+        assert!(Config::load(path.to_str().unwrap()).is_err());
+        std::fs::remove_file(path).unwrap();
+    }
+    fn chain_from(rpc: &str, extra: &str) -> Result<Chain, toml::de::Error> {
+        toml::from_str(&format!(
+            "id='eip155:1'\nname='Ethereum'\nconfirmations=1\nassets=[]\n{rpc}\n{extra}"
+        ))
+    }
+    #[test]
+    fn rpc_accepts_a_string_or_a_list_and_never_debug_prints_secrets() {
+        let one = chain_from("rpc='https://a.example/v2/SECRETKEY'", "").unwrap();
+        assert_eq!(one.rpc.urls(), ["https://a.example/v2/SECRETKEY"]);
+        let many = chain_from(
+            "rpc=['https://a.example/k1','https://b.example:8545/k2?x=SECRET']",
+            "",
+        )
+        .unwrap();
+        assert_eq!(many.rpc.urls().len(), 2);
+        let shown = format!("{:?}", many.rpc);
+        assert!(shown.contains("a.example") && shown.contains("b.example:8545"));
+        assert!(!shown.contains("k1") && !shown.contains("SECRET"));
+        assert!(chain_from("rpc=5", "").is_err());
+        assert_eq!(one.poll_interval(), std::time::Duration::from_secs(6));
+        let tuned = chain_from("rpc='https://a.example'", "poll_interval_ms=750").unwrap();
+        assert_eq!(tuned.poll_interval(), std::time::Duration::from_millis(750));
+    }
+    #[test]
+    fn rpc_lists_and_poll_intervals_are_validated() {
+        let source = include_str!("../config/payroof.local.toml");
+        let path = std::env::temp_dir().join(format!(
+            "payroof-rpc-{}.toml",
+            crate::security::secret::id("test_").unwrap()
+        ));
+        let local = "rpc = \"http://127.0.0.1:8545\"";
+        assert!(source.contains(local));
+        for (replacement, ok) in [
+            (
+                "rpc = [\"http://127.0.0.1:8545\", \"http://127.0.0.1:8546\"]",
+                true,
+            ),
+            (
+                "rpc = \"http://127.0.0.1:8545\"\npoll_interval_ms = 250",
+                true,
+            ),
+            ("rpc = []", false),
+            (
+                "rpc = [\"http://127.0.0.1:8545\", \"http://127.0.0.1:8545\"]",
+                false,
+            ),
+            ("rpc = [\"http://127.0.0.1:8545\", \"not a url\"]", false),
+            (
+                "rpc = \"http://127.0.0.1:8545\"\npoll_interval_ms = 5",
+                false,
+            ),
+            (
+                "rpc = \"http://127.0.0.1:8545\"\npoll_interval_ms = 0",
+                false,
+            ),
+        ] {
+            std::fs::write(&path, source.replace(local, replacement)).unwrap();
+            assert_eq!(
+                Config::load(path.to_str().unwrap()).is_ok(),
+                ok,
+                "{replacement}"
+            );
+        }
+        // Production still requires HTTPS for every listed endpoint.
+        let example = include_str!("../config/payroof.example.toml");
+        std::fs::write(
+            &path,
+            example.replacen(
+                "https://base.publicnode.com",
+                "http://base.publicnode.com",
+                1,
+            ),
+        )
+        .unwrap();
         assert!(Config::load(path.to_str().unwrap()).is_err());
         std::fs::remove_file(path).unwrap();
     }

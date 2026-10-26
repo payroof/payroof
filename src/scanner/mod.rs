@@ -1,43 +1,41 @@
 //! Sequential canonical block observation. Native transfers are top-level EVM
 //! transactions; value moved by internal calls is not observed.
+pub mod rpc;
 use crate::{App, config::Chain, security::secret::id, time::now};
 use num_bigint::BigUint;
+use rpc::Rpc;
 use serde_json::{Value, json};
 use sqlx::Row;
-use std::{collections::BTreeSet, time::Duration};
+use std::{
+    collections::BTreeMap,
+    time::{Duration, Instant},
+};
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
-pub fn client() -> anyhow::Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?)
+/// Most blocks one scan step observes before yielding to the poll loop.
+pub const MAX_BLOCKS_PER_STEP: usize = 20;
+/// A head this many blocks below the highest one seen comes from a lagging node (a real
+/// reorg is far shallower) and is not used.
+const HEAD_REGRESSION_TOLERANCE: i64 = 32;
+/// While the head is unchanged, the last scanned block is re-verified at this interval.
+const IDLE_RECHECK: Duration = Duration::from_secs(30);
+
+/// What a scanner remembers between steps (in memory only; nothing here is authoritative).
+#[derive(Default)]
+pub struct ScanState {
+    last_head: Option<i64>,
+    last_check: Option<Instant>,
+    /// `chain_state.healthy` is known to be 1, so idle polls need not write it again.
+    pub healthy_marked: bool,
 }
-pub async fn rpc(
-    http: &reqwest::Client,
-    url: &str,
-    method: &str,
-    params: Value,
-) -> anyhow::Result<Value> {
-    let mut r = http
-        .post(url)
-        .json(&json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}))
-        .send()
-        .await?
-        .error_for_status()?;
-    let mut b = Vec::new();
-    while let Some(chunk) = r.chunk().await? {
-        anyhow::ensure!(
-            b.len() + chunk.len() <= 8 * 1024 * 1024,
-            "RPC response too large"
-        );
-        b.extend(chunk);
-    }
-    let v: Value = serde_json::from_slice(&b)?;
-    anyhow::ensure!(v.get("error").is_none(), "RPC rejected request");
-    Ok(v.get("result")
-        .ok_or_else(|| anyhow::anyhow!("missing result"))?
-        .clone())
+/// Progress of one `scan` call.
+pub struct Outcome {
+    /// Blocks remain between the scan height and the head.
+    pub behind: bool,
+}
+enum Block {
+    Idle,
+    Rewound,
+    Scanned { next: i64 },
 }
 fn quantity(v: &Value) -> anyhow::Result<BigUint> {
     let s = v
@@ -117,15 +115,13 @@ struct Incoming {
     index: i64,
     amount: String,
 }
-/// The chain's current block height, once the RPC is confirmed to serve this chain.
-async fn head(chain: &Chain, http: &reqwest::Client) -> anyhow::Result<i64> {
-    let actual = height(&rpc(http, &chain.rpc, "eth_chainId", json!([])).await?)?;
-    anyhow::ensure!(chain.id == format!("eip155:{actual}"), "RPC chain mismatch");
-    height(&rpc(http, &chain.rpc, "eth_blockNumber", json!([])).await?)
+/// The chain's current block height, from the endpoint recorded in `pin` when usable.
+async fn head(rpc: &Rpc, pin: &mut Option<usize>) -> anyhow::Result<i64> {
+    height(&rpc.call(pin, "eth_blockNumber", json!([])).await?)
 }
 /// Records where scanning starts, on a chain's first run only: the configured
 /// `start_height`, or the chain's current head when none is configured.
-pub async fn init(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::Result<()> {
+pub async fn init(app: &App, chain: &Chain, rpc: &Rpc) -> anyhow::Result<()> {
     let known: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM chain_state WHERE chain=?)")
         .bind(&chain.id)
         .fetch_one(&app.db)
@@ -135,7 +131,7 @@ pub async fn init(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
     }
     let start = match chain.start_height {
         Some(height) => i64::try_from(height)?,
-        None => head(chain, http).await?,
+        None => head(rpc, &mut None).await?,
     };
     sqlx::query("INSERT INTO chain_state(chain,next_height) VALUES(?,?) ON CONFLICT DO NOTHING")
         .bind(&chain.id)
@@ -144,8 +140,87 @@ pub async fn init(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
         .await?;
     Ok(())
 }
-pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::Result<()> {
-    let head = head(chain, http).await?;
+/// The current head, or `None` when the answering node lags far behind what was seen
+/// (treated as "no new block"; the node is cooled down so another one is asked next).
+async fn observe_head(
+    rpc: &Rpc,
+    pin: &mut Option<usize>,
+    state: &ScanState,
+) -> anyhow::Result<Option<i64>> {
+    let mut lagged = false;
+    for _ in 0..rpc.len() {
+        let head = match head(rpc, pin).await {
+            Ok(head) => head,
+            // Only a lagging node answered; no other node is available right now.
+            Err(_) if lagged => return Ok(None),
+            Err(error) => return Err(error),
+        };
+        match (state.last_head, *pin) {
+            (Some(seen), Some(i)) if head + HEAD_REGRESSION_TOLERANCE < seen => {
+                rpc.penalize(i, "RPC endpoint lagging", None, false);
+                *pin = None;
+                lagged = true;
+            }
+            _ => return Ok(Some(head)),
+        }
+    }
+    Ok(None)
+}
+/// Observes up to `max_blocks` new blocks. Cheap when nothing changed: with an unchanged
+/// head only `eth_blockNumber` is requested (the last block is re-verified every 30 s).
+pub async fn scan(
+    app: &App,
+    chain: &Chain,
+    rpc: &Rpc,
+    state: &mut ScanState,
+    max_blocks: usize,
+) -> anyhow::Result<Outcome> {
+    let mut pin = None;
+    let Some(head) = observe_head(rpc, &mut pin, state).await? else {
+        return Ok(Outcome { behind: false });
+    };
+    let unchanged = state.last_head == Some(head)
+        && state
+            .last_check
+            .is_some_and(|checked| checked.elapsed() < IDLE_RECHECK);
+    state.last_head = Some(head);
+    if unchanged {
+        let next: i64 = sqlx::query_scalar("SELECT next_height FROM chain_state WHERE chain=?")
+            .bind(&chain.id)
+            .fetch_one(&app.db)
+            .await?;
+        if next > head {
+            return Ok(Outcome { behind: false });
+        }
+    }
+    let mut behind = false;
+    for i in 0..max_blocks.max(1) {
+        match scan_block(app, chain, rpc, &mut pin, state, head, i == 0).await? {
+            Block::Idle => {
+                behind = false;
+                break;
+            }
+            Block::Rewound => {
+                behind = true;
+                break;
+            }
+            Block::Scanned { next } => behind = next <= head,
+        }
+        if !behind {
+            break;
+        }
+    }
+    Ok(Outcome { behind })
+}
+async fn scan_block(
+    app: &App,
+    chain: &Chain,
+    rpc: &Rpc,
+    pin: &mut Option<usize>,
+    state: &mut ScanState,
+    head: i64,
+    check_previous: bool,
+) -> anyhow::Result<Block> {
     let next: i64 = sqlx::query_scalar("SELECT next_height FROM chain_state WHERE chain=?")
         .bind(&chain.id)
         .fetch_one(&app.db)
@@ -156,14 +231,22 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
             .bind(next - 1)
             .fetch_optional(&app.db)
             .await?;
-    if let Some(previous) = &previous {
-        let actual = rpc(
-            http,
-            &chain.rpc,
-            "eth_getBlockByNumber",
-            json!([format!("0x{:x}", next - 1), false]),
-        )
-        .await?;
+    // Later blocks of a batch are chained to the previous one by `parentHash` below.
+    if let Some(previous) = previous.as_ref().filter(|_| check_previous) {
+        let actual = rpc
+            .call(
+                pin,
+                "eth_getBlockByNumber",
+                json!([format!("0x{:x}", next - 1), false]),
+            )
+            .await?;
+        state.last_check = Some(Instant::now());
+        // A node that does not know a block at or below the head it reported is behind
+        // (e.g. after failover); that is not evidence of a reorg.
+        anyhow::ensure!(
+            !actual.is_null() || next - 1 > head,
+            "RPC endpoint does not have the last scanned block yet"
+        );
         if actual.is_null() || text(&actual, "hash")? != *previous {
             let confirmed: bool = sqlx::query_scalar(
                 "SELECT EXISTS(SELECT 1 FROM transfers
@@ -198,23 +281,29 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
-            return Ok(());
+            return Ok(Block::Rewound);
         }
     }
     if next > head {
-        sqlx::query("UPDATE chain_state SET healthy=1 WHERE chain=?")
-            .bind(&chain.id)
-            .execute(&app.db)
-            .await?;
-        return Ok(());
+        if !state.healthy_marked {
+            sqlx::query("UPDATE chain_state SET healthy=1 WHERE chain=?")
+                .bind(&chain.id)
+                .execute(&app.db)
+                .await?;
+            state.healthy_marked = true;
+        }
+        return Ok(Block::Idle);
     }
-    let block = rpc(
-        http,
-        &chain.rpc,
-        "eth_getBlockByNumber",
-        json!([format!("0x{next:x}"), true]),
-    )
-    .await?;
+    // Transactions are only needed to see native transfers.
+    let watches_native = chain.assets.iter().any(|a| a.kind == "native");
+    let block = rpc
+        .call(
+            pin,
+            "eth_getBlockByNumber",
+            json!([format!("0x{next:x}"), watches_native]),
+        )
+        .await?;
+    anyhow::ensure!(!block.is_null(), "RPC endpoint does not have the block yet");
     let block_hash = text(&block, "hash")?;
     let parent = text(&block, "parentHash")?;
     anyhow::ensure!(
@@ -222,12 +311,17 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
         "inconsistent parent; retry canonical head"
     );
     // Watched assets: exactly the ones configured for this chain, nothing else.
-    let (mut natives, mut tokens) = (BTreeSet::new(), BTreeSet::new());
+    let mut natives = Vec::new();
+    let mut tokens: BTreeMap<String, String> = BTreeMap::new(); // contract -> asset id
     for a in &chain.assets {
         if a.kind == "native" {
-            natives.insert(a.id.clone());
+            natives.push(a.id.clone());
         } else {
-            tokens.insert(a.id.clone());
+            let contract =
+                a.id.split_once("/erc20:")
+                    .ok_or_else(|| anyhow::anyhow!("invalid token"))?
+                    .1;
+            tokens.insert(contract.to_owned(), a.id.clone());
         }
     }
     let mut incoming = Vec::new();
@@ -252,7 +346,9 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
             continue;
         }
         let hash = text(transaction, "hash")?;
-        let receipt = rpc(http, &chain.rpc, "eth_getTransactionReceipt", json!([hash])).await?;
+        let receipt = rpc
+            .call(pin, "eth_getTransactionReceipt", json!([hash]))
+            .await?;
         if receipt["status"] != "0x1" || receipt["blockHash"] != block_hash {
             continue;
         }
@@ -266,18 +362,19 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
             });
         }
     }
-    for asset in &tokens {
-        let contract = asset
-            .split_once("/erc20:")
-            .ok_or_else(|| anyhow::anyhow!("invalid token"))?
-            .1;
-        let logs = rpc(
-            http,
-            &chain.rpc,
-            "eth_getLogs",
-            json!([{"blockHash":block_hash,"address":contract,"topics":[TRANSFER_TOPIC]}]),
-        )
-        .await?;
+    if !tokens.is_empty() {
+        // One request per block for every watched token, pinned to this block's hash.
+        let address = match tokens.keys().collect::<Vec<_>>().as_slice() {
+            [one] => json!(one),
+            many => json!(many),
+        };
+        let logs = rpc
+            .call(
+                pin,
+                "eth_getLogs",
+                json!([{"blockHash":block_hash,"address":address,"topics":[TRANSFER_TOPIC]}]),
+            )
+            .await?;
         for log in logs
             .as_array()
             .ok_or_else(|| anyhow::anyhow!("invalid logs"))?
@@ -287,9 +384,9 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
             }
             // Reviewed RPCs still must not be allowed to bypass our configured
             // contract/event allowlist by ignoring eth_getLogs filter arguments.
-            if text(log, "address")? != contract {
+            let Some(asset) = tokens.get(&text(log, "address")?) else {
                 continue;
-            }
+            };
             let topics = log["topics"]
                 .as_array()
                 .ok_or_else(|| anyhow::anyhow!("invalid topics"))?;
@@ -337,13 +434,13 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
         }
     }
     // Verify the observed block still belongs to the current canonical chain before committing.
-    let current = rpc(
-        http,
-        &chain.rpc,
-        "eth_getBlockByNumber",
-        json!([format!("0x{next:x}"), false]),
-    )
-    .await?;
+    let current = rpc
+        .call(
+            pin,
+            "eth_getBlockByNumber",
+            json!([format!("0x{next:x}"), false]),
+        )
+        .await?;
     anyhow::ensure!(
         text(&current, "hash")? == block_hash,
         "block changed during scan"
@@ -425,5 +522,6 @@ pub async fn step(app: &App, chain: &Chain, http: &reqwest::Client) -> anyhow::R
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
-    Ok(())
+    state.healthy_marked = true;
+    Ok(Block::Scanned { next: next + 1 })
 }

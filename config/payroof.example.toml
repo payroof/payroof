@@ -1,6 +1,14 @@
 # A deployment watching the same networks, coins and tokens Payroof Wallet starts with.
 # Payroof watches exactly what is listed here: nothing can be added at runtime.
 # Review every RPC, confirmation depth and asset before use.
+#
+# `rpc` is one URL or a list in priority order: Payroof uses the first healthy endpoint
+# and moves to the next on rate limits (HTTP 429/403, JSON-RPC limit errors), outages and
+# timeouts, returning to earlier ones once their cooldown ends. The public endpoints below
+# are shared and rate limited; for production put your own provider (URL with API key) FIRST
+# and keep these as fallbacks. Never commit URLs that contain keys.
+# `poll_interval_ms` (optional, 100-300000) is how often a chain is polled for new blocks;
+# the default is about half the chain's block time.
 bind = "0.0.0.0:8080"
 origin = "https://api.example.com"
 # Other origins this server is served at, if any; recovery signatures may name them.
@@ -14,7 +22,8 @@ trusted_proxies = []
 [[chains]]
 id = "eip155:1"
 name = "Ethereum"
-rpc = "https://ethereum.publicnode.com"
+rpc = ["https://ethereum.publicnode.com", "https://eth.drpc.org", "https://eth.llamarpc.com"]
+poll_interval_ms = 6000  # default for Ethereum (12 s blocks)
 confirmations = 12
 # start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
 [[chains.assets]]
@@ -42,7 +51,8 @@ decimals = 18
 [[chains]]
 id = "eip155:8453"
 name = "Base"
-rpc = "https://base.publicnode.com"
+rpc = ["https://base.publicnode.com", "https://mainnet.base.org", "https://base.drpc.org"]
+poll_interval_ms = 2000
 confirmations = 20
 # start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
 [[chains.assets]]
@@ -60,7 +70,8 @@ decimals = 6
 [[chains]]
 id = "eip155:137"
 name = "Polygon"
-rpc = "https://polygon.drpc.org"
+rpc = ["https://polygon.drpc.org", "https://polygon-bor-rpc.publicnode.com", "https://polygon-rpc.com"]
+poll_interval_ms = 2000
 confirmations = 128
 # start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
 [[chains.assets]]
@@ -78,7 +89,8 @@ decimals = 6
 [[chains]]
 id = "eip155:42161"
 name = "Arbitrum One"
-rpc = "https://arb1.arbitrum.io/rpc"
+rpc = ["https://arb1.arbitrum.io/rpc", "https://arbitrum-one-rpc.publicnode.com", "https://arbitrum.drpc.org"]
+poll_interval_ms = 1000
 confirmations = 20
 # start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
 [[chains.assets]]
@@ -96,7 +108,8 @@ decimals = 6
 [[chains]]
 id = "eip155:56"
 name = "BNB Smart Chain"
-rpc = "https://bsc.publicnode.com"
+rpc = ["https://bsc.publicnode.com", "https://bsc-dataseed.bnbchain.org", "https://bsc.drpc.org"]
+poll_interval_ms = 1500
 confirmations = 15
 # start_height = 0  # omitted: scanning starts at the chain's head when Payroof first runs
 [[chains.assets]]

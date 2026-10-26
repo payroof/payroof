@@ -179,7 +179,17 @@ async fn seed(app: &App) {
     sqlx::query("INSERT INTO webhooks(id,project_id,url,events_json,secret_ciphertext,created_at) VALUES('wh_test',1,'http://127.0.0.1:1','[\"seen\",\"confirmed\"]','unused',0)").execute(&app.db).await.unwrap();
 }
 async fn step(app: &App) -> anyhow::Result<()> {
-    scanner::step(app, &app.config.chains[0], &scanner::client()?).await
+    // A fresh state and a one-block batch: every call re-verifies and scans one block.
+    let rpc = scanner::rpc::Rpc::new(&app.config.chains[0])?;
+    scanner::scan(
+        app,
+        &app.config.chains[0],
+        &rpc,
+        &mut scanner::ScanState::default(),
+        1,
+    )
+    .await
+    .map(|_| ())
 }
 async fn count(app: &App, table: &str) -> i64 {
     let query = match table {
@@ -652,7 +662,7 @@ async fn a_chain_without_a_start_height_begins_at_its_head_once() {
     let first = app(&rpc, None).await;
     let mut chain = first.config.chains[0].clone();
     chain.start_height = None;
-    let http = scanner::client().unwrap();
+    let http = scanner::rpc::Rpc::new(&chain).unwrap();
     scanner::init(&first, &chain, &http).await.unwrap();
     assert_eq!(next(&first).await, 42);
     // Later starts keep the recorded position.
@@ -665,4 +675,135 @@ async fn a_chain_without_a_start_height_begins_at_its_head_once() {
         .await
         .unwrap();
     assert_eq!(next(&other).await, 1);
+}
+
+fn methods(rpc: &FakeRpc) -> Vec<String> {
+    let mut data = rpc.data.lock().unwrap();
+    data.calls
+        .drain(..)
+        .map(|c| c["method"].as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn unchanged_head_costs_one_request_and_a_batch_catches_up_in_one_step() {
+    let rpc = FakeRpc::start().await;
+    rpc.data.lock().unwrap().head = 2;
+    let app = app(&rpc, None).await;
+    seed(&app).await;
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    // Both blocks in one step; the second is chained by parentHash, not re-fetched.
+    let outcome = scanner::scan(&app, chain, &client, &mut state, 20)
+        .await
+        .unwrap();
+    assert!(!outcome.behind);
+    assert_eq!(next(&app).await, 3);
+    // Idle: the first idle step re-verifies the tip, later ones only ask for the head.
+    scanner::scan(&app, chain, &client, &mut state, 20)
+        .await
+        .unwrap();
+    methods(&rpc);
+    for _ in 0..3 {
+        scanner::scan(&app, chain, &client, &mut state, 20)
+            .await
+            .unwrap();
+    }
+    assert_eq!(methods(&rpc), vec!["eth_blockNumber"; 3]);
+    // A new block resumes full work.
+    {
+        let mut data = rpc.data.lock().unwrap();
+        data.head = 3;
+        data.blocks.insert(3, block(3, 3, 2, vec![]));
+    }
+    scanner::scan(&app, chain, &client, &mut state, 20)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 4);
+}
+
+#[tokio::test]
+async fn full_transactions_are_requested_only_when_a_native_asset_is_watched() {
+    let rpc = FakeRpc::start().await;
+    let app = app(&rpc, None).await;
+    seed(&app).await;
+    let mut chain = app.config.chains[0].clone();
+    chain.assets.retain(|a| a.kind != "native");
+    let client = scanner::rpc::Rpc::new(&chain).unwrap();
+    scanner::scan(&app, &chain, &client, &mut Default::default(), 1)
+        .await
+        .unwrap();
+    let flags: Vec<Value> = rpc
+        .data
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c["method"] == "eth_getBlockByNumber")
+        .map(|c| c["params"][1].clone())
+        .collect();
+    assert!(!flags.is_empty() && flags.iter().all(|f| f == false));
+    assert_eq!(count(&app, "transfers").await, 1); // the token transfer only
+}
+
+#[tokio::test]
+async fn a_lagging_node_is_ignored_and_a_dead_primary_fails_over() {
+    let rpc = FakeRpc::start().await;
+    let app = app(&rpc, None).await;
+    seed(&app).await;
+    let mut chain = app.config.chains[0].clone();
+    chain.rpc = serde_json::from_value(json!(["http://127.0.0.1:1/KEY", rpc.url])).unwrap();
+    let client = scanner::rpc::Rpc::new(&chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    rpc.data.lock().unwrap().head = 500;
+    scanner::scan(&app, &chain, &client, &mut state, 1)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 2); // served by the second endpoint
+    // The only node now reports a head far below the one seen: treated as no new block.
+    rpc.data.lock().unwrap().head = 3;
+    methods(&rpc);
+    let outcome = scanner::scan(&app, &chain, &client, &mut state, 20)
+        .await
+        .unwrap();
+    assert!(!outcome.behind);
+    assert_eq!(next(&app).await, 2);
+    assert_eq!(methods(&rpc), vec!["eth_blockNumber"]);
+}
+
+#[tokio::test]
+async fn idle_workers_poll_at_the_configured_interval_without_rewriting_heartbeats() {
+    let rpc = FakeRpc::start().await;
+    let mut app = app(&rpc, None).await;
+    Arc::get_mut(&mut app).unwrap().config.chains[0].poll_interval_ms = Some(200);
+    seed(&app).await;
+    sqlx::query("DELETE FROM webhooks")
+        .execute(&app.db)
+        .await
+        .unwrap();
+    let _workers = Workers(payroof::workers::start(app.clone()));
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while ready(&app).await != axum::http::StatusCode::OK {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("workers become ready");
+    let beats = || async {
+        sqlx::query_as::<_, (String, i64)>("SELECT name,heartbeat FROM worker_state ORDER BY name")
+            .fetch_all(&app.db)
+            .await
+            .unwrap()
+    };
+    // Let the scanner reach the idle state (block 1 and 2 scanned, then head only).
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (before, calls_before) = (beats().await, rpc.data.lock().unwrap().calls.len());
+    assert_eq!(before.len(), 2);
+    tokio::time::sleep(Duration::from_millis(2100)).await;
+    let polls = rpc.data.lock().unwrap().calls.len() - calls_before;
+    // ~10 polls of eth_blockNumber at 200 ms, and no heartbeat write in between.
+    assert!((5..=14).contains(&polls), "{polls} idle requests");
+    assert_eq!(beats().await, before);
+    assert_eq!(ready(&app).await, axum::http::StatusCode::OK);
 }

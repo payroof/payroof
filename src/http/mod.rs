@@ -49,7 +49,7 @@ async fn challenge(
     Ok(Json(altcha::challenge(&app.altcha_key, &q.purpose)?))
 }
 /// Ready when not draining and every scanner and the delivery worker reported
-/// healthy within the last minute.
+/// healthy within the last 90 seconds.
 async fn ready(State(app): State<App>) -> error::Result<Json<serde_json::Value>> {
     let unready = || error::Error::unavailable("worker_unready");
     if app.draining.load(std::sync::atomic::Ordering::Relaxed) {
@@ -61,7 +61,7 @@ async fn ready(State(app): State<App>) -> error::Result<Json<serde_json::Value>>
                 (SELECT COUNT(*) FROM worker_state
                  WHERE healthy=1 AND heartbeat>? AND (name='delivery' OR name LIKE 'scanner:%'))",
     )
-    .bind(crate::time::now() - 60)
+    .bind(crate::time::now() - crate::workers::HEARTBEAT_STALE)
     .fetch_one(&app.db)
     .await?;
     if healthy_chains != chains || live_workers != chains + 1 {

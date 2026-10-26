@@ -3,7 +3,7 @@
 #   docker compose up -d        # pulls the release image, or builds it with --build
 services:
   payroof:
-    image: ghcr.io/payroof/payroof:0.1.0
+    image: ghcr.io/payroof/payroof:0.2.0
     build: .
     restart: unless-stopped
     read_only: true

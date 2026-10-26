@@ -17,9 +17,44 @@ the assets listed**; nothing can be added at runtime.
 | `database` | SQLite URL; its directory must be writable |
 | `development` | Allows HTTP origins/RPCs and private webhook targets. **Never in production** |
 | `trusted_proxies` | CIDRs whose forwarding headers set the client IP |
-| `[[chains]]` | `id` (`eip155:<n>`), `name` (display, 1-40 chars), `rpc`, `confirmations`, optional `start_height` (default: the head at first run) |
+| `[[chains]]` | `id` (`eip155:<n>`), `name` (display, 1-40 chars), `rpc` (a URL or a list of URLs, see [RPC endpoints](#rpc-endpoints)), `confirmations`, optional `poll_interval_ms`, optional `start_height` (default: the head at first run) |
 | `[[chains.assets]]` | `id` (`eip155:<n>/slip44:<coin>` or `eip155:<n>/erc20:<contract>`), `kind`, `symbol`, `decimals` |
 | `[limits]` | Rate, body, concurrency and capacity limits; omitted keys keep the defaults below |
+
+## RPC endpoints
+
+`rpc` is a single URL (as before) or a list in priority order, at most 8, all HTTPS
+outside development:
+
+```toml
+[[chains]]
+id = "eip155:1"
+name = "Ethereum"
+rpc = ["https://eth-provider.example/v2/YOUR_KEY", "https://ethereum.publicnode.com", "https://eth.drpc.org"]
+poll_interval_ms = 6000   # optional
+confirmations = 12
+```
+
+- Payroof uses the first healthy endpoint. A rate limit (HTTP 429, 403, 401, JSON-RPC
+  `-32005`/`-32029` or an error mentioning "rate limit", "exceeded" or "capacity"), a 5xx
+  response, a timeout or an invalid response puts that endpoint into a cooldown (5 s,
+  doubling per consecutive failure up to 2 minutes, or longer if the server sends
+  `Retry-After`) and the request is retried on the next endpoint. After the cooldown the
+  earlier endpoint is preferred again. An endpoint that serves another chain id is rejected.
+- Requests of one scan step stay on one endpoint unless it fails. A head more than 32
+  blocks below the highest one seen is treated as a lagging node and ignored.
+- When all endpoints are cooling down the chain waits for the first one to recover and
+  `/readyz` reports not ready; the log shows one line per state change.
+- Put a provider URL with an API key first and public endpoints after it. URLs are
+  secrets: logs and errors show only `scheme://host`. Keep keys out of version control.
+- `poll_interval_ms` (100-300000) is the pause between checks for a new block. Default by
+  chain id: Ethereum (`eip155:1`) 6000, BNB Smart Chain (`eip155:56`) 1500, Arbitrum One
+  (`eip155:42161`) 1000, anything else (including Base and Polygon) 2000. While the head is
+  unchanged a poll is a single `eth_blockNumber`. Each new block costs about four requests
+  (parent check, block, one `eth_getLogs` for all tokens, canonical re-check) plus one
+  receipt per transaction paying a watched address; up to 20 blocks are observed per step
+  while catching up. Chains with very fast blocks (Arbitrum) need a provider with a
+  generous request quota.
 
 ## Limits
 
