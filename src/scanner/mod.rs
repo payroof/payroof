@@ -18,6 +18,10 @@ pub const MAX_BLOCKS_PER_STEP: usize = 20;
 const HEAD_REGRESSION_TOLERANCE: i64 = 32;
 /// While the head is unchanged, the last scanned block is re-verified at this interval.
 const IDLE_RECHECK: Duration = Duration::from_secs(30);
+/// How long a block below the reported head may stay unavailable before the scanner reports
+/// it. Load-balanced providers announce a head before every backend has the block; that is
+/// retried on the next poll instead of marking the chain unhealthy.
+const MISSING_BLOCK_GRACE: Duration = Duration::from_secs(60);
 
 /// What a scanner remembers between steps (in memory only; nothing here is authoritative).
 #[derive(Default)]
@@ -26,6 +30,8 @@ pub struct ScanState {
     last_check: Option<Instant>,
     /// `chain_state.healthy` is known to be 1, so idle polls need not write it again.
     pub healthy_marked: bool,
+    /// A block the node reported but could not return yet, and since when.
+    missing: Option<(i64, Instant)>,
 }
 /// Progress of one `scan` call.
 pub struct Outcome {
@@ -303,7 +309,22 @@ async fn scan_block(
             json!([format!("0x{next:x}"), watches_native]),
         )
         .await?;
-    anyhow::ensure!(!block.is_null(), "RPC endpoint does not have the block yet");
+    if block.is_null() {
+        let since = match state.missing {
+            Some((height, since)) if height == next => since,
+            _ => Instant::now(),
+        };
+        anyhow::ensure!(
+            since.elapsed() < MISSING_BLOCK_GRACE,
+            "RPC endpoint does not have block {next} below head {head}"
+        );
+        state.missing = Some((next, since));
+        tracing::debug!(chain=%chain.id, height = next, "block not available yet; retrying");
+        // Ask a different backend next time rather than the one that just lagged.
+        *pin = None;
+        return Ok(Block::Idle);
+    }
+    state.missing = None;
     let block_hash = text(&block, "hash")?;
     let parent = text(&block, "parentHash")?;
     anyhow::ensure!(

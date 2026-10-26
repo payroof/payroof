@@ -3,6 +3,10 @@
 All notable changes to this project are documented in this file. The format is based
 on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.2.1] - 2026-10-26
+
+- A block below the reported head that the node cannot return yet (load-balanced providers announce a head before every backend has it) is retried on the next poll, preferably on another endpoint, instead of marking the chain unhealthy and briefly failing `/readyz` with 503. It is reported as an error only if it stays unavailable for 60 s.
+
 ## [0.2.0] - 2026-10-26
 
 - Several RPC endpoints per chain: `rpc` accepts a URL or a priority-ordered list. Rate limits (HTTP 429/403/401, JSON-RPC -32005/-32029 and "rate limit"/"exceeded"/"capacity" errors), 5xx and timeouts cool an endpoint down with exponential backoff (honouring `Retry-After`) and the request moves to the next endpoint; recovered endpoints are preferred again. Existing single-URL configs keep working.

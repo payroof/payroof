@@ -807,3 +807,30 @@ async fn idle_workers_poll_at_the_configured_interval_without_rewriting_heartbea
     assert_eq!(beats().await, before);
     assert_eq!(ready(&app).await, axum::http::StatusCode::OK);
 }
+
+#[tokio::test]
+async fn a_block_missing_below_the_head_is_retried_not_an_error() {
+    let rpc = FakeRpc::start().await;
+    let app = app(&rpc, None).await;
+    seed(&app).await;
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    // The node reports head 3 before it can return block 3 (a lagging backend).
+    rpc.data.lock().unwrap().head = 3;
+    let outcome = scanner::scan(&app, chain, &client, &mut state, 20)
+        .await
+        .unwrap();
+    assert!(!outcome.behind);
+    assert_eq!(next(&app).await, 3);
+    // Once the block is served, scanning resumes from the same height.
+    rpc.data
+        .lock()
+        .unwrap()
+        .blocks
+        .insert(3, block(3, 3, 2, vec![]));
+    scanner::scan(&app, chain, &client, &mut state, 20)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 4);
+}
