@@ -43,7 +43,7 @@ pub fn start(app: App) -> Vec<tokio::task::JoinHandle<()>> {
 /// written at once. `/readyz` accepts heartbeats up to `HEARTBEAT_STALE` old.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 /// Pause between scan steps while blocks remain to catch up on.
-const CATCH_UP_PAUSE: Duration = Duration::from_millis(250);
+const CATCH_UP_PAUSE: Duration = Duration::from_millis(50);
 /// Pause after an error that is not an RPC outage.
 const ERROR_PAUSE: Duration = Duration::from_secs(5);
 

@@ -9,6 +9,7 @@
 # and keep these as fallbacks. Never commit URLs that contain keys.
 # `poll_interval_ms` (optional, 100-300000) is how often a chain is polled for new blocks;
 # the default is about half the chain's block time.
+# `max_concurrency` (optional, 1-32, default 8) caps parallel RPC requests while catching up.
 bind = "0.0.0.0:8080"
 origin = "https://api.example.com"
 # Other origins this server is served at, if any; recovery signatures may name them.

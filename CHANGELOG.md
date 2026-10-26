@@ -3,6 +3,13 @@
 All notable changes to this project are documented in this file. The format is based
 on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.0] - 2026-10-26
+
+- Much faster catch-up on remote RPC endpoints. A scan step now observes up to 100 blocks (was 20): the blocks are fetched concurrently (up to `max_concurrency` requests in flight, default 8, per chain, range 1-32), checked against each other by `parentHash` and against the last committed block, verified once against the canonical chain at the window's newest block, and committed in order in transactions of up to 25 blocks. Receipts of native transfers are fetched concurrently too. Measured against the public Arbitrum One endpoint: about 26-28 blocks/s (was about 2.7 blocks/s with the sequential scanner).
+- Token logs for the older blocks of a window come from a single `eth_getLogs` over the block range; each log's `blockHash` must match the fetched block, otherwise that block's logs are asked for by block hash. A range the node refuses (result-count or block-range limits, including providers that report them with the rate-limit code -32005) is split and remembered, without cooling the endpoint down. The newest 4 blocks and single-block steps still use one `eth_getLogs` by block hash.
+- When endpoints push back (429, timeouts, outages) the scanner halves its concurrency and grows it again by one request per clean step. A burst of concurrent failures on one endpoint counts as a single incident for its cooldown. Failover, redacted URLs and the idle path (one `eth_blockNumber`) are unchanged.
+- Reorg handling, confirmations and the atomic commit of transfers, events, webhook deliveries and the checkpoint are unchanged. If a block of a window does not chain to the previous one or is not available yet, the blocks before it are committed and the rest is fetched again.
+
 ## [0.2.1] - 2026-10-26
 
 - A block below the reported head that the node cannot return yet (load-balanced providers announce a head before every backend has it) is retried on the next poll, preferably on another endpoint, instead of marking the chain unhealthy and briefly failing `/readyz` with 503. It is reported as an error only if it stays unavailable for 60 s.

@@ -44,6 +44,8 @@ struct RpcData {
     calls: Vec<Value>,
     canonical_override: Option<String>,
     ignore_log_filters: bool,
+    /// Widest `fromBlock..toBlock` range a node accepts (a provider's limit), if any.
+    max_log_range: Option<u64>,
 }
 struct FakeRpc {
     data: Arc<Mutex<RpcData>>,
@@ -69,6 +71,7 @@ impl FakeRpc {
             calls: vec![],
             canonical_override: None,
             ignore_log_filters: false,
+            max_log_range: None,
         }));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -114,6 +117,27 @@ async fn reply(
             .unwrap_or(Value::Null),
         "eth_getLogs" => {
             let filter = &request["params"][0];
+            if filter.get("fromBlock").is_some() {
+                let number = |v: &Value| {
+                    u64::from_str_radix(v.as_str().unwrap().trim_start_matches("0x"), 16).unwrap()
+                };
+                let (from, to) = (number(&filter["fromBlock"]), number(&filter["toBlock"]));
+                if data.max_log_range.is_some_and(|max| to - from + 1 > max) {
+                    return Json(json!({"jsonrpc":"2.0","id":request["id"],"error":
+                        {"code":-32005,"message":"query returned more than 10000 results"}}));
+                }
+                let logs: Vec<&Value> = data
+                    .logs
+                    .iter()
+                    .filter(|l| {
+                        l["address"] == filter["address"]
+                            && l["topics"][0] == filter["topics"][0]
+                            && l.get("blockNumber")
+                                .is_some_and(|n| (from..=to).contains(&number(n)))
+                    })
+                    .collect();
+                return Json(json!({"jsonrpc":"2.0","id":request["id"],"result":logs}));
+            }
             // Model node-side contract/topic filtering, including unrelated token logs.
             json!(
                 data.logs
@@ -833,4 +857,241 @@ async fn a_block_missing_below_the_head_is_retried_not_an_error() {
         .await
         .unwrap();
     assert_eq!(next(&app).await, 4);
+}
+
+/// Replaces the node's chain with blocks `from..=to` (hash = `base + height`, each chained to
+/// the previous one; `from` is chained to hash `base + from - 1`) and sets the head.
+fn set_chain(data: &mut RpcData, base: u64, from: u64, to: u64) {
+    for n in from..=to {
+        data.blocks
+            .insert(n, block(n, base + n, base + n - 1, vec![]));
+    }
+    data.head = to;
+}
+fn log_at(tx: u64, height: u64, block_id: u64) -> Value {
+    let mut l = log(tx, block_id, TOKEN);
+    l["blockNumber"] = json!(format!("0x{height:x}"));
+    l
+}
+fn getlogs(rpc: &FakeRpc) -> (usize, usize) {
+    let data = rpc.data.lock().unwrap();
+    let calls = data.calls.iter().filter(|c| c["method"] == "eth_getLogs");
+    let ranges = calls
+        .clone()
+        .filter(|c| c["params"][0].get("fromBlock").is_some())
+        .count();
+    (ranges, calls.count() - ranges)
+}
+async fn catch_up_app(rpc: &FakeRpc) -> App {
+    {
+        let mut data = rpc.data.lock().unwrap();
+        data.blocks.clear();
+        data.receipts.clear();
+        data.logs.clear();
+        set_chain(&mut data, 0, 1, 150);
+    }
+    let app = app(rpc, None).await;
+    seed(&app).await;
+    app
+}
+
+#[tokio::test]
+async fn range_catch_up_observes_150_blocks_in_two_steps() {
+    let rpc = FakeRpc::start().await;
+    let app = catch_up_app(&rpc).await;
+    {
+        let mut data = rpc.data.lock().unwrap();
+        data.blocks.insert(10, block(10, 10, 9, vec![native(100)]));
+        data.receipts
+            .insert(hash(100), json!({"status":"0x1","blockHash":hash(10)}));
+        // Deep in the range, and inside the live margin next to the head.
+        data.logs = vec![log_at(200, 20, 20), log_at(201, 149, 149)];
+    }
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    let first = scanner::scan(
+        &app,
+        chain,
+        &client,
+        &mut state,
+        scanner::MAX_BLOCKS_PER_STEP,
+    )
+    .await
+    .unwrap();
+    assert!(first.behind);
+    assert_eq!(next(&app).await, 101);
+    let second = scanner::scan(
+        &app,
+        chain,
+        &client,
+        &mut state,
+        scanner::MAX_BLOCKS_PER_STEP,
+    )
+    .await
+    .unwrap();
+    assert!(!second.behind);
+    assert_eq!(next(&app).await, 151);
+    assert_eq!(count(&app, "chain_blocks").await, 150);
+    assert_eq!(count(&app, "transfers").await, 3);
+    assert_eq!(states(&app).await, vec!["confirmed"; 3]);
+    let heights: Vec<i64> =
+        sqlx::query_scalar("SELECT block_height FROM transfers ORDER BY block_height")
+            .fetch_all(&app.db)
+            .await
+            .unwrap();
+    assert_eq!(heights, vec![10, 20, 149]);
+    // Two range queries cover everything but the newest blocks, which are asked by hash.
+    let (ranges, by_hash) = getlogs(&rpc);
+    assert_eq!((ranges, by_hash), (2, 4));
+    let block_requests = rpc
+        .data
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|c| c["method"] == "eth_getBlockByNumber")
+        .count();
+    // 150 blocks + one parent check and one tip check per window, not 3 per block.
+    assert!(block_requests <= 150 + 4, "{block_requests}");
+}
+
+#[tokio::test]
+async fn range_logs_with_a_foreign_block_hash_are_replaced_by_the_blocks_own_logs() {
+    let rpc = FakeRpc::start().await;
+    let app = catch_up_app(&rpc).await;
+    {
+        let mut data = rpc.data.lock().unwrap();
+        // Block 20: a stale-fork log next to the real one; block 30: only a stale-fork log.
+        data.logs = vec![
+            log_at(300, 20, 9999),
+            log_at(200, 20, 20),
+            log_at(301, 30, 9998),
+        ];
+    }
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    scanner::scan(&app, chain, &client, &mut Default::default(), 100)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 101);
+    let txs: Vec<String> = sqlx::query_scalar("SELECT transaction_id FROM transfers")
+        .fetch_all(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(txs, vec![hash(200)]);
+    let calls = rpc.data.lock().unwrap().calls.clone();
+    let asked: Vec<&Value> = calls
+        .iter()
+        .filter(|c| c["method"] == "eth_getLogs" && c["params"][0].get("blockHash").is_some())
+        .map(|c| &c["params"][0]["blockHash"])
+        .collect();
+    assert!(asked.contains(&&json!(hash(20))) && asked.contains(&&json!(hash(30))));
+}
+
+#[tokio::test]
+async fn a_log_range_the_node_refuses_is_split_without_cooling_the_endpoint() {
+    let rpc = FakeRpc::start().await;
+    let app = catch_up_app(&rpc).await;
+    {
+        let mut data = rpc.data.lock().unwrap();
+        data.max_log_range = Some(10);
+        data.logs = vec![log_at(200, 5, 5), log_at(201, 95, 95)];
+    }
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    scanner::scan(&app, chain, &client, &mut state, 100)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 101);
+    assert_eq!(count(&app, "transfers").await, 2);
+    assert!(client.retry_in().is_none());
+    assert_eq!(client.pressure(), 0);
+    let (ranges, _) = getlogs(&rpc);
+    assert!(ranges > 10, "{ranges} range requests");
+    // The scanner remembers the node's limit: the next window needs no failed attempts.
+    methods(&rpc);
+    scanner::scan(&app, chain, &client, &mut state, 100)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 151);
+}
+
+#[tokio::test]
+async fn a_reorg_below_a_scanned_window_is_rewound_and_the_new_chain_rescanned() {
+    let rpc = FakeRpc::start().await;
+    let app = catch_up_app(&rpc).await;
+    {
+        let mut data = rpc.data.lock().unwrap();
+        set_chain(&mut data, 0, 1, 59);
+        data.logs = vec![log_at(200, 59, 59)];
+    }
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    scanner::scan(&app, chain, &client, &mut state, 100)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 60);
+    assert_eq!(states(&app).await, vec!["seen"]);
+    // The chain forks at 58 and grows to 140, with a transfer on the new branch.
+    {
+        let mut data = rpc.data.lock().unwrap();
+        set_chain(&mut data, 1000, 58, 140);
+        data.blocks.get_mut(&58).unwrap()["parentHash"] = json!(hash(57));
+        data.logs = vec![log_at(201, 100, 1100)];
+    }
+    for _ in 0..20 {
+        let outcome = scanner::scan(&app, chain, &client, &mut state, 100)
+            .await
+            .unwrap();
+        if !outcome.behind {
+            break;
+        }
+    }
+    assert_eq!(next(&app).await, 141);
+    assert_eq!(count(&app, "chain_blocks").await, 140);
+    let tip: String = sqlx::query_scalar("SELECT hash FROM chain_blocks WHERE height=140")
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(tip, hash(1140));
+    let rows: Vec<(String, i64)> =
+        sqlx::query_as("SELECT state,block_height FROM transfers ORDER BY block_height")
+            .fetch_all(&app.db)
+            .await
+            .unwrap();
+    assert_eq!(
+        rows,
+        vec![("orphaned".to_string(), 59), ("confirmed".to_string(), 100)]
+    );
+}
+
+#[tokio::test]
+async fn blocks_of_a_window_that_do_not_chain_are_cut_off_and_refetched() {
+    let rpc = FakeRpc::start().await;
+    let app = catch_up_app(&rpc).await;
+    rpc.data.lock().unwrap().blocks.get_mut(&21).unwrap()["parentHash"] = json!(hash(9999));
+    let chain = &app.config.chains[0];
+    let client = scanner::rpc::Rpc::new(chain).unwrap();
+    let mut state = scanner::ScanState::default();
+    scanner::scan(&app, chain, &client, &mut state, 100)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 21); // blocks 1..=20 chain; the rest are not committed
+    assert!(
+        scanner::scan(&app, chain, &client, &mut state, 100)
+            .await
+            .err()
+            .expect("must fail")
+            .to_string()
+            .contains("inconsistent parent")
+    );
+    assert_eq!(next(&app).await, 21);
+    rpc.data.lock().unwrap().blocks.get_mut(&21).unwrap()["parentHash"] = json!(hash(20));
+    scanner::scan(&app, chain, &client, &mut state, 100)
+        .await
+        .unwrap();
+    assert_eq!(next(&app).await, 121);
 }

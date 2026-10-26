@@ -17,7 +17,7 @@ the assets listed**; nothing can be added at runtime.
 | `database` | SQLite URL; its directory must be writable |
 | `development` | Allows HTTP origins/RPCs and private webhook targets. **Never in production** |
 | `trusted_proxies` | CIDRs whose forwarding headers set the client IP |
-| `[[chains]]` | `id` (`eip155:<n>`), `name` (display, 1-40 chars), `rpc` (a URL or a list of URLs, see [RPC endpoints](#rpc-endpoints)), `confirmations`, optional `poll_interval_ms`, optional `start_height` (default: the head at first run) |
+| `[[chains]]` | `id` (`eip155:<n>`), `name` (display, 1-40 chars), `rpc` (a URL or a list of URLs, see [RPC endpoints](#rpc-endpoints)), `confirmations`, optional `poll_interval_ms`, optional `max_concurrency`, optional `start_height` (default: the head at first run) |
 | `[[chains.assets]]` | `id` (`eip155:<n>/slip44:<coin>` or `eip155:<n>/erc20:<contract>`), `kind`, `symbol`, `decimals` |
 | `[limits]` | Rate, body, concurrency and capacity limits; omitted keys keep the defaults below |
 
@@ -32,6 +32,7 @@ id = "eip155:1"
 name = "Ethereum"
 rpc = ["https://eth-provider.example/v2/YOUR_KEY", "https://ethereum.publicnode.com", "https://eth.drpc.org"]
 poll_interval_ms = 6000   # optional
+max_concurrency = 8       # optional
 confirmations = 12
 ```
 
@@ -50,11 +51,17 @@ confirmations = 12
 - `poll_interval_ms` (100-300000) is the pause between checks for a new block. Default by
   chain id: Ethereum (`eip155:1`) 6000, BNB Smart Chain (`eip155:56`) 1500, Arbitrum One
   (`eip155:42161`) 1000, anything else (including Base and Polygon) 2000. While the head is
-  unchanged a poll is a single `eth_blockNumber`. Each new block costs about four requests
+  unchanged a poll is a single `eth_blockNumber`. A block near the head costs about four requests
   (parent check, block, one `eth_getLogs` for all tokens, canonical re-check) plus one
-  receipt per transaction paying a watched address; up to 20 blocks are observed per step
-  while catching up. Chains with very fast blocks (Arbitrum) need a provider with a
-  generous request quota.
+  receipt per transaction paying a watched address.
+- `max_concurrency` (1-32, default 8) is the most requests in flight at once while catching
+  up. A step then observes up to 100 blocks: they are fetched concurrently, token logs of
+  the older blocks come from one `eth_getLogs` per block range, and the result is checked
+  and committed in order. The scanner halves the concurrency itself while endpoints answer
+  with rate limits or errors and raises it again afterwards, so the value is a ceiling.
+  Lower it for a provider with a tight per-second quota; raise it (and list several
+  endpoints) for a fast node. Expect roughly `max_concurrency / latency` blocks per second
+  (about 30-50 per second on remote endpoints at the default).
 
 ## Limits
 

@@ -5,7 +5,10 @@
 use crate::config::Chain;
 use serde_json::{Value, json};
 use std::{
-    sync::Mutex,
+    sync::{
+        Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -54,8 +57,21 @@ impl std::fmt::Display for Unavailable {
 }
 impl std::error::Error for Unavailable {}
 
+/// An `eth_getLogs` request was refused for its size (block range or result count); the
+/// caller should ask for a smaller range. The endpoint is not penalised for this.
+#[derive(Debug)]
+pub struct RangeLimit;
+impl std::fmt::Display for RangeLimit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("eth_getLogs range or result limit exceeded")
+    }
+}
+impl std::error::Error for RangeLimit {}
+
 /// Why one attempt failed.
 enum Fault {
+    /// The request was too large for the node (see [`RangeLimit`]).
+    Range,
     /// The endpoint is limiting, down or wrong: cool it down and try the next one.
     Endpoint {
         reason: String,
@@ -74,6 +90,28 @@ impl Fault {
             long: false,
         }
     }
+}
+
+/// Whether a JSON-RPC error message means "ask for fewer logs" (providers word this
+/// differently and some reuse the rate-limit code -32005 for it).
+fn is_range_error(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "query returned more than",
+        "more than 10000 results",
+        "too many results",
+        "block range",
+        "range is too large",
+        "range too large",
+        "range limit",
+        "response size",
+        "limit the query",
+        "query timeout exceeded",
+        "exceed maximum block range",
+        "too many blocks",
+    ]
+    .iter()
+    .any(|needle| message.contains(needle))
 }
 
 /// Whether a JSON-RPC error object means "slow down" rather than "bad request".
@@ -112,6 +150,9 @@ struct Endpoint {
 struct Health {
     failures: u32,
     cooling_until: Option<Instant>,
+    /// When the endpoint was last penalised; concurrent requests that began before that
+    /// do not escalate the cooldown again.
+    last_penalty: Option<Instant>,
     verified: bool,
 }
 
@@ -122,6 +163,7 @@ pub struct Rpc {
     health: Mutex<Vec<Health>>,
     base: Duration,
     max: Duration,
+    pressure: AtomicU64,
 }
 impl std::fmt::Debug for Rpc {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -167,7 +209,13 @@ impl Rpc {
             endpoints,
             base,
             max,
+            pressure: AtomicU64::new(0),
         })
+    }
+    /// How many endpoint failures (limits, outages, timeouts) were recorded so far; a
+    /// caller that sees it grow should send fewer requests at once.
+    pub fn pressure(&self) -> u64 {
+        self.pressure.load(Ordering::Relaxed)
     }
     pub fn len(&self) -> usize {
         self.endpoints.len()
@@ -216,8 +264,32 @@ impl Rpc {
     }
     /// Starts or extends a cooldown: exponential, at least the server's `Retry-After`.
     pub fn penalize(&self, i: usize, reason: &str, retry_after: Option<Duration>, long: bool) {
+        self.penalize_since(i, Instant::now(), reason, retry_after, long);
+    }
+    /// Like [`Self::penalize`] for a request started at `started`: when another request
+    /// already penalised the endpoint after that, this failure belongs to the same
+    /// incident and does not escalate the cooldown (a burst of concurrent 429s counts once).
+    fn penalize_since(
+        &self,
+        i: usize,
+        started: Instant,
+        reason: &str,
+        retry_after: Option<Duration>,
+        long: bool,
+    ) {
+        self.pressure.fetch_add(1, Ordering::Relaxed);
         let mut health = self.health();
         let h = &mut health[i];
+        if h.last_penalty.is_some_and(|at| at > started) {
+            if let Some(server) = retry_after {
+                let until = Instant::now() + server;
+                if h.cooling_until.is_none_or(|c| c < until) {
+                    h.cooling_until = Some(until);
+                }
+            }
+            return;
+        }
+        h.last_penalty = Some(Instant::now());
         h.failures = h.failures.saturating_add(1);
         h.verified = false;
         let exponent = (h.failures - 1).min(16);
@@ -259,6 +331,7 @@ impl Rpc {
         }
         let mut last = String::from("no endpoint answered");
         for i in order {
+            let started = Instant::now();
             match self.attempt(i, method, &params).await {
                 Ok(value) => {
                     self.succeed(i);
@@ -270,13 +343,14 @@ impl Rpc {
                     retry_after,
                     long,
                 }) => {
-                    self.penalize(i, &reason, retry_after, long);
+                    self.penalize_since(i, started, &reason, retry_after, long);
                     if *prefer == Some(i) {
                         *prefer = None;
                     }
                     last = reason;
                 }
                 Err(Fault::Request(reason)) => last = reason,
+                Err(Fault::Range) => return Err(RangeLimit.into()),
             }
         }
         match self.retry_in() {
@@ -340,7 +414,11 @@ impl Rpc {
             match response.chunk().await {
                 Ok(Some(chunk)) => {
                     if body.len() + chunk.len() > MAX_RESPONSE {
-                        return Err(Fault::endpoint("RPC response too large"));
+                        return Err(if method == "eth_getLogs" {
+                            Fault::Range
+                        } else {
+                            Fault::endpoint("RPC response too large")
+                        });
                     }
                     body.extend(chunk);
                 }
@@ -353,6 +431,9 @@ impl Rpc {
         if let Some(error) = value.get("error") {
             let code = error.get("code").and_then(Value::as_i64).unwrap_or(0);
             let message = error.get("message").and_then(Value::as_str).unwrap_or("");
+            if method == "eth_getLogs" && is_range_error(message) {
+                return Err(Fault::Range);
+            }
             return Err(if is_limit_error(code, message) {
                 Fault::endpoint(format!("RPC rate limited (code {code})"))
             } else {
@@ -528,6 +609,32 @@ mod tests {
         let mut headers = reqwest::header::HeaderMap::new();
         headers.insert("retry-after", "999999".parse().unwrap());
         assert_eq!(retry_after(&headers), Some(MAX_RETRY_AFTER));
+    }
+
+    #[tokio::test]
+    async fn a_burst_of_concurrent_failures_counts_as_one_incident() {
+        let (hits, a) = node("429", "0x1").await;
+        let rpc = pool(&[a], 1000);
+        let calls = (0..8).map(|_| call(&rpc));
+        let results = futures_util::future::join_all(calls).await;
+        assert!(results.iter().all(Result::is_err));
+        assert!(hits.hits.load(Ordering::SeqCst) >= 1);
+        // One 1 s cooldown (plus Retry-After: 1), not 2^8 s.
+        assert!(rpc.retry_in().unwrap() <= Duration::from_secs(2));
+        assert!(rpc.pressure() >= 1);
+    }
+
+    #[test]
+    fn range_errors_are_told_apart_from_rate_limits() {
+        for message in [
+            "query returned more than 10000 results",
+            "eth_getLogs is limited to a 10000 block range",
+            "Log response size exceeded",
+            "exceed maximum block range: 5000",
+        ] {
+            assert!(is_range_error(message), "{message}");
+        }
+        assert!(!is_range_error("daily request count exceeded") && !is_range_error("rate limit"));
     }
 
     #[tokio::test]

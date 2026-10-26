@@ -34,7 +34,14 @@ Log lines to expect: `RPC endpoint cooling down` (warning, once per outage, with
 host only), `RPC endpoint recovered`, and one `scanner unavailable` error per state or
 error change while a chain is unready. Persistent `all RPC endpoints unavailable` means
 every listed endpoint is limiting or down: add endpoints, raise `poll_interval_ms`, or
-use a paid plan. The SQLite database runs in WAL mode with `synchronous=NORMAL`; after a
+use a paid plan.
+
+Catch-up: a chain that is far behind fetches up to 100 blocks per step with up to
+`max_concurrency` requests in flight (see [RPC endpoints](configuration.md#rpc-endpoints)),
+so the backlog shrinks at tens of blocks per second on remote endpoints. Rate limits make the
+scanner slow itself down (visible as `RPC endpoint cooling down` warnings); if they persist,
+add endpoints or lower `max_concurrency`. Every block is still chained by `parentHash` and
+committed in order, and reorgs are handled exactly as at the head. The SQLite database runs in WAL mode with `synchronous=NORMAL`; after a
 power loss the newest commits may be lost, in which case the scanner re-observes those
 blocks (webhooks are at-least-once).
 

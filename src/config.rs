@@ -117,6 +117,9 @@ pub struct Chain {
     /// Milliseconds between polls for new blocks. Omitted: about half the chain's
     /// block time (see [`default_poll_interval_ms`]).
     pub poll_interval_ms: Option<u64>,
+    /// Most RPC requests in flight at once while catching up (the scanner lowers it by
+    /// itself when the endpoints push back). Omitted: [`DEFAULT_MAX_CONCURRENCY`].
+    pub max_concurrency: Option<usize>,
     /// First block to scan. Omitted: the chain's head when Payroof first runs.
     pub start_height: Option<u64>,
     pub assets: Vec<Asset>,
@@ -152,6 +155,8 @@ impl std::fmt::Debug for RpcUrls {
 pub const MAX_RPC_URLS: usize = 8;
 pub const MIN_POLL_INTERVAL_MS: u64 = 100;
 pub const MAX_POLL_INTERVAL_MS: u64 = 300_000;
+pub const DEFAULT_MAX_CONCURRENCY: usize = 8;
+pub const MAX_CONCURRENCY: usize = 32;
 /// Poll interval for a chain id: roughly half its block time, 2s when unknown.
 pub fn default_poll_interval_ms(chain_id: &str) -> u64 {
     match chain_id {
@@ -162,6 +167,9 @@ pub fn default_poll_interval_ms(chain_id: &str) -> u64 {
     }
 }
 impl Chain {
+    pub fn max_concurrency(&self) -> usize {
+        self.max_concurrency.unwrap_or(DEFAULT_MAX_CONCURRENCY)
+    }
     pub fn poll_interval(&self) -> std::time::Duration {
         std::time::Duration::from_millis(
             self.poll_interval_ms
@@ -218,6 +226,9 @@ impl Config {
                     && !chain.name.chars().any(char::is_control)
                     && chain.confirmations > 0
                     && chain.start_height.is_none_or(|h| h <= i64::MAX as u64)
+                    && chain
+                        .max_concurrency
+                        .is_none_or(|n| (1..=MAX_CONCURRENCY).contains(&n))
                     && chain.poll_interval_ms.is_none_or(|ms| (MIN_POLL_INTERVAL_MS
                         ..=MAX_POLL_INTERVAL_MS)
                         .contains(&ms)),
@@ -352,6 +363,18 @@ mod tests {
             (
                 "rpc = \"http://127.0.0.1:8545\"\npoll_interval_ms = 250",
                 true,
+            ),
+            (
+                "rpc = \"http://127.0.0.1:8545\"\nmax_concurrency = 16",
+                true,
+            ),
+            (
+                "rpc = \"http://127.0.0.1:8545\"\nmax_concurrency = 0",
+                false,
+            ),
+            (
+                "rpc = \"http://127.0.0.1:8545\"\nmax_concurrency = 33",
+                false,
             ),
             ("rpc = []", false),
             (

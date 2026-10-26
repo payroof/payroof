@@ -8,7 +8,7 @@ keywords = ["crypto", "payments", "ethereum", "webhooks", "watch-only"]
 categories = ["cryptography::cryptocurrencies", "web-programming::http-server"]
 # The published crate holds only what it builds from (no apps, CI, tests or Docker).
 include = ["src/**", "migrations/**", "config/*.toml", "README.md", "CHANGELOG.md", "LICENSE-*"]
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.99"
 license = "MIT OR Apache-2.0"
@@ -19,6 +19,7 @@ axum = "=0.8.9"
 base64 = "=0.23.1"
 chacha20poly1305 = "=0.11.0"
 chrono = { version = "=0.4.45", features = ["serde"] }
+futures-util = { version = "=0.3.34", default-features = false, features = ["std", "alloc"] }
 getrandom = "=0.4.3"
 hex = "=0.4.3"
 hmac = "=0.13.0"

@@ -1411,7 +1411,7 @@ dependencies = [
 
 [[package]]
 name = "payroof"
-version = "0.2.1"
+version = "0.3.0"
 dependencies = [
  "altcha",
  "anyhow",
@@ -1420,6 +1420,7 @@ dependencies = [
  "chacha20poly1305",
  "chrono",
  "ed25519-dalek",
+ "futures-util",
  "getrandom 0.4.3",
  "hex",
  "hmac 0.13.0",
