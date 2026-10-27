@@ -43,7 +43,9 @@ pub async fn webhook_client(
     }
     // Pin validated DNS addresses in a fresh client for each delivery attempt.
     // TLS verification and SNI still use the original hostname, never an attacker-provided IP.
+    // Webhook receivers' responses are not read: no need to advertise compression.
     Ok(reqwest::Client::builder()
+        .no_gzip()
         .redirect(reqwest::redirect::Policy::none())
         .no_proxy()
         .timeout(timeout)

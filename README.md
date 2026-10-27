@@ -26,7 +26,7 @@ A public server runs at [`api.payroof.top`](https://payroof.top), ready for Payr
 
 - Homebrew: `brew install payroof/tap/payroof`
 - Cargo: `cargo install payroof`
-- Docker: `docker pull ghcr.io/payroof/payroof:0.3.0` (see [`compose.yaml`](compose.yaml))
+- Docker: `docker pull ghcr.io/payroof/payroof:0.3.1` (see [`compose.yaml`](compose.yaml))
 - Prebuilt binaries: see [GitHub Releases](https://github.com/payroof/payroof/releases).
 
 ## Quick start

@@ -3,6 +3,11 @@
 All notable changes to this project are documented in this file. The format is based
 on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.1] - 2026-10-28
+
+- RPC responses are requested gzip-compressed (`Accept-Encoding: gzip`) and decompressed transparently. Full blocks, fetched whenever a native coin is watched, shrink about 3-10x on the wire (measured on public endpoints: Base 279 KiB to 67 KiB, Polygon 183 KiB to 30 KiB, BNB Smart Chain 72 KiB to 27 KiB per block); endpoints that do not compress are unaffected. The 8 MiB response limit applies to the decompressed body, so a small compressed reply cannot inflate past it.
+- Webhook deliveries are unchanged: they do not advertise compression.
+
 ## [0.3.0] - 2026-10-26
 
 - Much faster catch-up on remote RPC endpoints. A scan step now observes up to 100 blocks (was 20): the blocks are fetched concurrently (up to `max_concurrency` requests in flight, default 8, per chain, range 1-32), checked against each other by `parentHash` and against the last committed block, verified once against the canonical chain at the window's newest block, and committed in order in transactions of up to 25 blocks. Receipts of native transfers are fetched concurrently too. Measured against the public Arbitrum One endpoint: about 26-28 blocks/s (was about 2.7 blocks/s with the sequential scanner).

@@ -19,8 +19,11 @@ const MAX_COOLDOWN: Duration = Duration::from_secs(120);
 /// A server's `Retry-After` is honoured up to this long.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(600);
 
+/// HTTP client for RPC endpoints. Responses may be gzip-compressed (`Accept-Encoding: gzip`):
+/// full blocks shrink 3-10x on the wire. `MAX_RESPONSE` bounds the decompressed body.
 pub fn client() -> anyhow::Result<reqwest::Client> {
     Ok(reqwest::Client::builder()
+        .gzip(true)
         .timeout(Duration::from_secs(10))
         .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
@@ -463,8 +466,23 @@ mod tests {
         hits: Arc<AtomicUsize>,
         chain: &'static str,
     }
+    /// `body` gzip-compressed, as a node honouring `Accept-Encoding: gzip` sends it.
+    fn gzipped(body: &[u8]) -> axum::response::Response {
+        use std::io::Write;
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
+        encoder.write_all(body).unwrap();
+        (
+            [
+                ("content-type", "application/json"),
+                ("content-encoding", "gzip"),
+            ],
+            encoder.finish().unwrap(),
+        )
+            .into_response()
+    }
     async fn reply(
         State(node): State<Node>,
+        headers: axum::http::HeaderMap,
         axum::Json(req): axum::Json<Value>,
     ) -> axum::response::Response {
         if req["method"] == "eth_chainId" {
@@ -485,6 +503,23 @@ mod tests {
                 json!({"jsonrpc":"2.0","id":1,"error":{"code":-32005,"message":"limit exceeded"}}),
             )
             .into_response(),
+            // Compressed replies only for clients that ask for them.
+            "gzip" | "gzip-bomb"
+                if !headers
+                    .get("accept-encoding")
+                    .and_then(|v| v.to_str().ok())
+                    .is_some_and(|v| v.contains("gzip")) =>
+            {
+                StatusCode::NOT_ACCEPTABLE.into_response()
+            }
+            "gzip" => gzipped(br#"{"jsonrpc":"2.0","id":1,"result":"0x10"}"#),
+            // About 10 KiB on the wire, more than MAX_RESPONSE once decompressed.
+            "gzip-bomb" => {
+                let mut body = br#"{"jsonrpc":"2.0","id":1,"result":"0x10""#.to_vec();
+                body.resize(MAX_RESPONSE + 1024, b' ');
+                body.push(b'}');
+                gzipped(&body)
+            }
             "bad" => axum::Json(
                 json!({"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params"}}),
             )
@@ -562,6 +597,20 @@ mod tests {
             assert_eq!(secondary.hits.load(Ordering::SeqCst), 2);
             assert!(rpc.retry_in().is_none());
         }
+    }
+
+    #[tokio::test]
+    async fn accepts_gzip_and_bounds_the_decompressed_response() {
+        let (gzip_node, url) = node("gzip", "0x1").await;
+        let rpc = pool(&[url], 400);
+        assert_eq!(call(&rpc).await.unwrap(), "0x10");
+        assert_eq!(gzip_node.hits.load(Ordering::SeqCst), 1);
+
+        // A small compressed body that inflates past MAX_RESPONSE is refused, not buffered.
+        let (_, url) = node("gzip-bomb", "0x1").await;
+        let rpc = pool(&[url], 400);
+        let error = format!("{:#}", call(&rpc).await.unwrap_err());
+        assert!(error.contains("RPC response too large"), "{error}");
     }
 
     #[tokio::test]
