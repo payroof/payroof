@@ -1095,3 +1095,46 @@ async fn blocks_of_a_window_that_do_not_chain_are_cut_off_and_refetched() {
         .unwrap();
     assert_eq!(next(&app).await, 121);
 }
+
+#[tokio::test]
+async fn old_block_hashes_are_pruned_in_batches_and_recent_ones_kept() {
+    use payroof::scanner::{KEPT_BLOCKS, PRUNE_BATCH};
+    let rpc = FakeRpc::start().await;
+    {
+        let mut data = rpc.data.lock().unwrap();
+        data.head = 3;
+        data.blocks.insert(3, block(3, 3, 2, vec![]));
+    }
+    let app = app(&rpc, None).await;
+    seed(&app).await;
+    // A backlog left by earlier releases, which kept every block: below anything the chain scans.
+    let backlog = 2 * PRUNE_BATCH + KEPT_BLOCKS;
+    sqlx::query(
+        "WITH RECURSIVE h(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM h WHERE n<?)
+         INSERT INTO chain_blocks(chain,height,hash,parent_hash) SELECT ?, -n, 'old', 'old' FROM h",
+    )
+    .bind(backlog)
+    .bind(CHAIN)
+    .execute(&app.db)
+    .await
+    .unwrap();
+    step(&app).await.unwrap();
+    // One commit deletes at most one batch.
+    assert_eq!(count(&app, "chain_blocks").await, backlog + 1 - PRUNE_BATCH);
+    step(&app).await.unwrap();
+    step(&app).await.unwrap();
+    assert_eq!(next(&app).await, 4);
+    let below: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chain_blocks WHERE height < 4 - ?")
+        .bind(KEPT_BLOCKS)
+        .fetch_one(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(below, 0);
+    // The window behind the checkpoint stays, so rewinds still work.
+    assert_eq!(count(&app, "chain_blocks").await, KEPT_BLOCKS - 1);
+    let tip: Option<String> = sqlx::query_scalar("SELECT hash FROM chain_blocks WHERE height=3")
+        .fetch_optional(&app.db)
+        .await
+        .unwrap();
+    assert_eq!(tip, Some(hash(3)));
+}

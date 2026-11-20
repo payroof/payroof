@@ -22,6 +22,12 @@ const LIVE_MARGIN: i64 = 4;
 /// A head this many blocks below the highest one seen comes from a lagging node (a real
 /// reorg is far shallower) and is not used.
 const HEAD_REGRESSION_TOLERANCE: i64 = 32;
+/// Block hashes kept per chain behind the checkpoint. A rewind steps back one stored block at a
+/// time and no other code reads them, so older ones are deleted. Never fewer than a chain's
+/// confirmations, so every reorg that can touch an unconfirmed transfer is still rewound.
+pub const KEPT_BLOCKS: i64 = 1024;
+/// Most old block hashes one commit deletes, so a large backlog drains in short transactions.
+pub const PRUNE_BATCH: i64 = 5_000;
 /// While the head is unchanged, the last scanned block is re-verified at this interval.
 const IDLE_RECHECK: Duration = Duration::from_secs(30);
 /// How long a block below the reported head may stay unavailable before the scanner reports
@@ -884,6 +890,16 @@ async fn commit(app: &App, chain: &Chain, blocks: &[Observed]) -> anyhow::Result
         .bind(&chain.id)
         .execute(&mut *tx)
         .await?;
+    let kept = KEPT_BLOCKS.max(i64::from(chain.confirmations));
+    sqlx::query(
+        "DELETE FROM chain_blocks WHERE rowid IN
+         (SELECT rowid FROM chain_blocks WHERE chain=? AND height<? ORDER BY height LIMIT ?)",
+    )
+    .bind(&chain.id)
+    .bind(newest + 1 - kept)
+    .bind(PRUNE_BATCH)
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }

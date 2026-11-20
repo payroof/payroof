@@ -3,6 +3,11 @@
 All notable changes to this project are documented in this file. The format is based
 on Keep a Changelog, and this project adheres to Semantic Versioning.
 
+## [0.3.2] - 2026-11-20
+
+- Old block hashes are deleted. Earlier releases kept a row in `chain_blocks` for every block ever scanned, although only the newest ones are read (to detect a reorg), so an idle instance watching five chains grew by about 150 MB a day (2.8 GB in under three weeks). Each commit now keeps the newest 1024 hashes per chain (never fewer than the chain's `confirmations`) and deletes at most 5000 older ones, so an existing backlog drains in short transactions while scanning continues. The freed pages are reused; run `VACUUM` once with the service stopped to shrink an existing database file.
+- Reorg handling, confirmations and the scan checkpoint are unchanged.
+
 ## [0.3.1] - 2026-10-28
 
 - RPC responses are requested gzip-compressed (`Accept-Encoding: gzip`) and decompressed transparently. Full blocks, fetched whenever a native coin is watched, shrink about 3-10x on the wire (measured on public endpoints: Base 279 KiB to 67 KiB, Polygon 183 KiB to 30 KiB, BNB Smart Chain 72 KiB to 27 KiB per block); endpoints that do not compress are unaffected. The 8 MiB response limit applies to the decompressed body, so a small compressed reply cannot inflate past it.
