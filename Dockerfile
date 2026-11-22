@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1
 # Build: a static, size-optimised musl binary (see [profile.release] in Cargo.toml).
-FROM rust:1.99.1-alpine3.24@sha256:dc578ff3ca62ef489ad9ae743f477b94d98739c3092d0023490ecd417c2eebea AS builder
+FROM rust:1.100.0-alpine3.24@sha256:8d0e82abfdf9a38071e07cabc5afba4ddbe077631a80e4e742a760c38beadc33 AS builder
 RUN apk add --no-cache build-base ca-certificates
 WORKDIR /build
 ENV CARGO_BUILD_JOBS=2
